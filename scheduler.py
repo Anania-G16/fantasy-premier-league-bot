@@ -1,27 +1,41 @@
 from apscheduler.schedulers.background import BackgroundScheduler
-from fpl_api import fetch_standings
+import requests
 import sqlite3
+import config
+from handlers import generate_current_gameweek_table, generate_winning_counts_table
 
-def check_gameweek_winner():
-    data = fetch_standings()
-    if not data:
+TELEGRAM_TOKEN = getattr(config, 'TELEGRAM_TOKEN', None)
+TEST_GROUP_ID = getattr(config, 'TEST_GROUP_ID', None)
+LEAGUE_ID = getattr(config, 'LEAGUE_ID', None)
+
+def test_send_updates():
+    if not TEST_GROUP_ID:
+        print("❌ TEST_GROUP_ID not set in config.py")
         return
-    results = data.get("standings", {}).get("results", [])
-    if not results:
-        return
+
+    # Combine live table and wins table for a thorough test payload
+    message_text = "🧪 *Automated 2-Minute Test Update* 🧪\n\n"
+    message_text += generate_current_gameweek_table() + "\n\n"
+    message_text += generate_winning_counts_table()
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TEST_GROUP_ID,
+        "text": message_text
+    }
     
-    # Sort by gameweek points (event_total)
-    sorted_by_gw = sorted(results, key=lambda x: x.get("event_total", 0), reverse=True)
-    winner = sorted_by_gw[0]
-    
-    # Log winner to SQLite database...
-    conn = sqlite3.connect("fpl_bot.db")
-    cursor = conn.cursor()
-    # Insert logic here
-    conn.commit()
-    conn.close()
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("✅ 2-minute test message sent successfully to the group!")
+        else:
+            print(f"❌ Failed to send message: {response.text}")
+    except Exception as e:
+        print(f"❌ Scheduler error: {e}")
 
 def setup_scheduler():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(check_gameweek_winner, 'cron', day_of_week='tue', hour=9)
+    # Runs the test update every 2 minutes
+    scheduler.add_job(test_send_updates, 'interval', minutes=2)
     scheduler.start()
+    print("⏳ Scheduler started: testing updates every 2 minutes.")
