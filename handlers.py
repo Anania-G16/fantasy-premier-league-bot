@@ -3,17 +3,36 @@ from telegram.ext import ContextTypes
 import sqlite3
 import requests
 from config import LEAGUE_ID, MANAGER_HANDLES
+from collections import defaultdict
 
 def get_fpl_bootstrap():
-    """Helper to fetch bootstrap-static data for the current active gameweek."""
+    """Helper to fetch bootstrap-static data for current, previous, or upcoming gameweeks."""
     url = "https://fantasy.premierleague.com/api/bootstrap-static/"
     headers = {"User-Agent": "Mozilla/5.0"}
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
-        for event in res.json().get("events", []):
-            if event.get("is_current"):
-                return event.get("id")
-    return None
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            events = data.get("events", [])
+            
+            # 1. Look for an active current gameweek
+            for event in events:
+                if event.get("is_current"):
+                    return event.get("id")
+            
+            # 2. Look for the next upcoming gameweek if nothing is currently live
+            for event in events:
+                if event.get("is_next"):
+                    return event.get("id")
+                    
+            # 3. Fallback to the latest finished gameweek if season is over or between gameweeks
+            finished_gws = [e.get("id") for e in events if e.get("finished")]
+            if finished_gws:
+                return max(finished_gws)
+    except Exception as e:
+        print(f"⚠️ Error fetching bootstrap-static: {e}")
+    
+    return 1
 
 def get_identity(entry_id, player_name):
     """Formats manager identity as 'Name (handle)' or just 'Name' if no handle exists."""
@@ -30,6 +49,7 @@ def generate_current_gameweek_table():
     standings_url = f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/"
     res = requests.get(standings_url, headers={"User-Agent": "Mozilla/5.0"})
     if res.status_code != 200:
+        print(f"⚠️ FPL API Error {res.status_code} for URL {standings_url}: {res.text}")
         return "❌ Failed to fetch league standings."
 
     results = res.json().get("standings", {}).get("results", [])
@@ -40,28 +60,42 @@ def generate_current_gameweek_table():
     for manager in results:
         entry_id = manager.get("entry")
         player_name = manager.get("player_name")
-        gw_points = manager.get("event_total", 0)
+        
+        # Fetch individual manager history to get exact current/upcoming gameweek points safely
+        history_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/"
+        h_res = requests.get(history_url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        points = 0
+        if h_res.status_code == 200:
+            history_data = h_res.json().get("current", [])
+            for event in history_data:
+                if event.get("event") == current_gw:
+                    points = event.get("points", 0)
+                    break
 
         gw_scores.append({
             "entry_id": entry_id,
             "player_name": player_name,
-            "points": gw_points
+            "points": points
         })
 
     gw_scores.sort(key=lambda x: x["points"], reverse=True)
 
     msg = f"🟢 Gameweek {current_gw} Live Table 🟢\n\n"
     for idx, m in enumerate(gw_scores, start=1):
-        identity = get_identity(m["entry_id"], m["player_name"])
+        identity = get_identity(m["entry_id"], m["player_name"]).replace("_", " ")
         msg += f"{idx}. {identity} — {m['points']} pts\n"
 
     return msg
 
 def generate_total_points_table():
     standings_url = f"https://fantasy.premierleague.com/api/leagues-classic/{LEAGUE_ID}/standings/"
-    res = requests.get(standings_url, headers={"User-Agent": "Mozilla/5.0"})
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    res = requests.get(standings_url, headers=headers)
+    
     if res.status_code != 200:
-        return "❌ Failed to fetch total standings."
+        print(f"⚠️ FPL API Error {res.status_code} for URL {standings_url}: {res.text}")
+        return f"❌ Failed to fetch total standings. (Status: {res.status_code})"
 
     data = res.json()
     league_name = data.get("league", {}).get("name", "League of Royalties")
@@ -133,6 +167,35 @@ def generate_net_gain_table():
 
     return msg
 
+def generate_winning_counts_table():
+    conn = sqlite3.connect("fpl_bot.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT manager_name, gameweek 
+        FROM gameweek_winners 
+        ORDER BY manager_name, gameweek ASC
+    ''')
+    data = cursor.fetchall()
+    conn.close()
+
+    manager_wins = defaultdict(list)
+    for manager_name, gw in data:
+        manager_wins[manager_name].append(str(gw))
+
+    sorted_managers = sorted(manager_wins.items(), key=lambda x: len(x[1]), reverse=True)
+
+    msg = "🏆 Gameweek Winner Counts & History 🏆\n\n"
+    if not sorted_managers:
+        msg += "No gameweek winners recorded yet!"
+        return msg
+
+    for idx, (manager_name, gws) in enumerate(sorted_managers, start=1):
+        count = len(gws)
+        gw_list = ", ".join(gws)
+        msg += f"{idx}. {manager_name} — {count} — GW({gw_list})\n"
+
+    return msg
+
 
 # --- Telegram Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,26 +210,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/wins - View total gameweek win counts for each manager\n"
     )
     await update.message.reply_text(welcome_text)
+
 async def live_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Fetching live gameweek standings...")
+    status_msg = await update.message.reply_text("Fetching live gameweek standings...")
     table_text = generate_current_gameweek_table()
-    await update.message.reply_text(table_text)
+    await status_msg.edit_text(table_text)
 
 async def total_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Fetching total league standings...")
+    status_msg = await update.message.reply_text("Fetching total league standings...")
     table_text = generate_total_points_table()
-    await update.message.reply_text(table_text)
+    await status_msg.edit_text(table_text)
 
 async def final_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("⏳ Figuring out latest gameweek & fetching standings...")
 
     target_gw = None
     
-    # Check if a gameweek argument was passed (e.g. /final 2)
     if context.args and context.args[0].isdigit():
         target_gw = int(context.args[0])
     else:
-        # Auto-detect latest finished gameweek from bootstrap-static
         url = "https://fantasy.premierleague.com/api/bootstrap-static/"
         try:
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -239,39 +301,7 @@ async def final_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def net_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table_text = generate_net_gain_table()
     await update.message.reply_text(table_text)
-from collections import defaultdict
-import sqlite3
 
-def generate_winning_counts_table():
-    conn = sqlite3.connect("fpl_bot.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT manager_name, gameweek 
-        FROM gameweek_winners 
-        ORDER BY manager_name, gameweek ASC
-    ''')
-    data = cursor.fetchall()
-    conn.close()
-
-    # Group gameweeks by manager name
-    manager_wins = defaultdict(list)
-    for manager_name, gw in data:
-        manager_wins[manager_name].append(str(gw))
-
-    # Sort managers by total wins descending
-    sorted_managers = sorted(manager_wins.items(), key=lambda x: len(x[1]), reverse=True)
-
-    msg = "🏆 Gameweek Winner Counts & History 🏆\n\n"
-    if not sorted_managers:
-        msg += "No gameweek winners recorded yet!"
-        return msg
-
-    for idx, (manager_name, gws) in enumerate(sorted_managers, start=1):
-        count = len(gws)
-        gw_list = ", ".join(gws)
-        msg += f"{idx}. {manager_name} — {count} — GW({gw_list})\n"
-
-    return msg
 async def wins_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table_text = generate_winning_counts_table()
     await update.message.reply_text(table_text)
